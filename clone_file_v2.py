@@ -453,6 +453,7 @@ def build_model(hp=None):
     Builds the Conv1D-Transformer model.
     If `hp` is a KerasTuner HyperParameters object, values are sampled from it.
     Otherwise DEFAULT_HP is used — so the function works both for tuning and final training.
+    
     """
     def get(key, choices=None, min_val=None, max_val=None, step=None, default=None):
         if hp is None:
