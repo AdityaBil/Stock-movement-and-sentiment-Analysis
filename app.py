@@ -1,5 +1,4 @@
 
-
 import os, json, warnings
 import numpy as np
 import pandas as pd
@@ -19,15 +18,14 @@ warnings.filterwarnings('ignore')
 # ──────────────────────────────────────────────────────────────
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "model_config.json")
-# Prefer artifacts from clone_file_v2.py; fall back to legacy names
-MODEL_PATH  = os.path.join(BASE_DIR, "stock_model.keras")
-MODEL_FALLBACK = os.path.join(BASE_DIR, "transformer_with_sentiment.keras")
+MODEL_PATH  = os.path.join(BASE_DIR, "best_model.keras")
 SCALER_PATH = os.path.join(BASE_DIR, "scaler.pkl")
-SCALER_FALLBACK = os.path.join(BASE_DIR, "scaler_sentiment.pkl")
+SCALER_FALLBACK = os.path.join(BASE_DIR, "scaler.pkl")
+SCALER_FALLBACK2 = os.path.join(BASE_DIR, "scaler_sentiment.pkl")
 FINBERT_DIR = os.path.join(BASE_DIR, "finbert_finetuned")
 
 print("=" * 55)
-print("  QUANTUS v4 — Flask Backend Starting")
+print("  AURELIUS v4 — Flask Backend Starting")
 print("=" * 55)
 
 # ── Config ──────────────────────────────────────────────────
@@ -67,13 +65,18 @@ SCALER_TYPE    = cfg.get("scaler_type", "RobustScaler")
 def gelu(x):
     return x * 0.5 * (1.0 + tf.math.erf(x / tf.math.sqrt(2.0)))
 
-def focal_loss_fn(y_true, y_pred):
+def focal_loss(y_true, y_pred):
     gamma = 2.0; alpha = 0.5
     y_pred  = tf.clip_by_value(y_pred, 1e-7, 1-1e-7)
     pt      = tf.where(tf.equal(y_true, 1), y_pred, 1-y_pred)
     alpha_t = tf.where(tf.equal(y_true, 1), alpha, 1-alpha)
-    fl      = -alpha_t * tf.pow(1-pt, gamma) * tf.math.log(pt)
-    return tf.reduce_mean(fl)
+    return tf.reduce_mean(-alpha_t * tf.pow(1-pt, gamma) * tf.math.log(pt))
+
+# legacy name used by older checkpoints in clone_file_v2.py
+loss_fn = focal_loss
+
+# keep backwards compatibility alias
+focal_loss_fn = focal_loss
 
 from tensorflow.keras import layers
 
@@ -149,27 +152,28 @@ CUSTOM_OBJECTS = {
     "TransformerBlock":       TransformerBlock,
     "gelu":                   gelu,
     "focal_loss_fn":          focal_loss_fn,
+    "focal_loss":             focal_loss,
+    "loss_fn":               loss_fn,
 }
 
 # ── Load model ─────────────────────────────────────────────
 model  = None
 scaler = None
 
-_load_path = MODEL_PATH if os.path.exists(MODEL_PATH) else (
-    MODEL_FALLBACK if os.path.exists(MODEL_FALLBACK) else None
-)
-if _load_path:
+if os.path.exists(MODEL_PATH):
     try:
-        model = tf.keras.models.load_model(_load_path, custom_objects=CUSTOM_OBJECTS)
-        print("  ✓ Model loaded:", _load_path)
+        model = tf.keras.models.load_model(MODEL_PATH, custom_objects=CUSTOM_OBJECTS)
+        print("  ✓ Model loaded:", MODEL_PATH)
     except Exception as e:
         print(f"  ⚠ Model load failed: {e}")
 else:
-    print(f"  ⚠ No model file (tried {MODEL_PATH}, {MODEL_FALLBACK})")
+    print(f"  ⚠ Model not found: {MODEL_PATH} — run clone_file_v2.py to produce it")
 
-_scaler_path = SCALER_PATH if os.path.exists(SCALER_PATH) else (
-    SCALER_FALLBACK if os.path.exists(SCALER_FALLBACK) else None
-)
+_scaler_path = None
+for _p in (SCALER_PATH, SCALER_FALLBACK, SCALER_FALLBACK2):
+    if _p and os.path.exists(_p):
+        _scaler_path = _p
+        break
 if _scaler_path:
     try:
         scaler = joblib.load(_scaler_path)
@@ -177,7 +181,10 @@ if _scaler_path:
     except Exception as e:
         print(f"  ⚠ Scaler load failed: {e}")
 else:
-    print(f"  ⚠ No scaler (tried {SCALER_PATH}, {SCALER_FALLBACK})")
+    print(
+        f"  ⚠ No scaler — add {os.path.basename(SCALER_PATH)} next to app.py "
+        f"(or scaler.pkl)"
+    )
 
 # ── FinBERT ────────────────────────────────────────────────
 finbert_ok  = False
@@ -207,6 +214,47 @@ def get_news_sentiment(texts):
         return float(np.mean(probs[:, 0] - probs[:, 1]))  # pos - neg
     except:
         return 0.0
+
+def get_yf_headlines(symbol: str, limit: int = 10):
+    """
+    Fetch recent headlines for the symbol.
+    This is UI-supporting data enrichment only (does not alter the model architecture/calls).
+    """
+    try:
+        ticker = yf.Ticker(symbol)
+        items = getattr(ticker, "news", None) or []
+        headlines = []
+        for it in items:
+            title = ""
+
+            # yfinance structure (observed):
+            # { id: ..., content: { title: ..., summary: ..., ... } }
+            if isinstance(it, dict):
+                title = it.get("title") or it.get("headline") or ""  # sometimes present at top-level
+                if not title:
+                    title = it.get("summary") or it.get("description") or ""
+
+                content = it.get("content")
+                if (not title) and isinstance(content, dict):
+                    title = (
+                        content.get("title")
+                        or content.get("headline")
+                        or content.get("summary")
+                        or content.get("description")
+                        or ""
+                    )
+            else:
+                title = str(it)
+
+            title = str(title).strip()
+            if title:
+                headlines.append(title)
+            if len(headlines) >= limit:
+                break
+
+        return headlines
+    except:
+        return []
 
 # ──────────────────────────────────────────────────────────────
 # FEATURE ENGINEERING (mirrors clone_file_v2.py — no Target column)
@@ -378,12 +426,17 @@ def predict():
 
     data   = request.get_json(force=True)
     symbol = data.get("symbol", "AAPL").upper().strip()
-    news   = data.get("news", [])   # list of headline strings
+    user_news   = data.get("news", [])   # list of headline strings provided by frontend
+    news_for_ui  = user_news
+    if not user_news:
+        # Frontend currently sends `news: []`. Enrich for UI headlines only.
+        # Keep sentiment_score/model input behavior consistent.
+        news_for_ui = get_yf_headlines(symbol, limit=12)
 
-    # Sentiment
+    # Sentiment (model input) computed only from frontend-provided news
     sentiment_score = 0.0
-    if news and finbert_ok:
-        sentiment_score = get_news_sentiment(news)
+    if user_news and finbert_ok:
+        sentiment_score = get_news_sentiment(user_news)
 
     try:
         seq, feats_used, raw_df = get_latest_sequence(symbol, sentiment_score)
@@ -400,7 +453,7 @@ def predict():
     macd_v  = float(raw_df["MACD"].iloc[-1]) if "MACD" in raw_df.columns else None
     vol_ratio = float(raw_df["Volume_Ratio"].iloc[-1]) if "Volume_Ratio" in raw_df.columns else None
     bb_w = float(raw_df["BB_width"].iloc[-1]) if "BB_width" in raw_df.columns else None
-    headlines = [str(h).strip() for h in (news or []) if str(h).strip()]
+    headlines = [str(h).strip() for h in (news_for_ui or []) if str(h).strip()]
     recent = _recent_ohlcv(raw_df, n=60)
 
     payload = {
