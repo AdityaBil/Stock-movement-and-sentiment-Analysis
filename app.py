@@ -18,14 +18,14 @@ warnings.filterwarnings('ignore')
 # ──────────────────────────────────────────────────────────────
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "model_config.json")
-MODEL_PATH  = os.path.join(BASE_DIR, "best_model.keras")
+MODEL_PATH  = os.path.join(BASE_DIR, "stock_model.keras")
 SCALER_PATH = os.path.join(BASE_DIR, "scaler.pkl")
 SCALER_FALLBACK = os.path.join(BASE_DIR, "scaler.pkl")
 SCALER_FALLBACK2 = os.path.join(BASE_DIR, "scaler_sentiment.pkl")
 FINBERT_DIR = os.path.join(BASE_DIR, "finbert_finetuned")
 
 print("=" * 55)
-print("  AURELIUS v4 — Flask Backend Starting")
+print("  AURELIUS v4 - Flask Backend Starting")
 print("=" * 55)
 
 # ── Config ──────────────────────────────────────────────────
@@ -33,10 +33,10 @@ cfg = {}
 if os.path.exists(CONFIG_PATH):
     with open(CONFIG_PATH) as f:
         cfg = json.load(f)
-    print(f"  ✓ Config loaded: {len(cfg.get('features',[]))} features, "
+    print(f"  [OK] Config loaded: {len(cfg.get('features',[]))} features, "
           f"lookback={cfg.get('lookback',20)}, threshold={cfg.get('best_threshold',0.5)}")
 else:
-    print("  ⚠ model_config.json not found — run clone_file_v2.py first to train the model")
+    print("  [WARN] model_config.json not found - run clone_file_v2.py first to train the model")
 
 # Default feature list matches clone_file_v2.py when config is missing
 DEFAULT_FEATURES = [
@@ -146,10 +146,34 @@ class TransformerBlock(layers.Layer):
 # Older checkpoints may serialize as MultiHeadAttention
 MultiHeadAttention = MultiHeadSelfAttention
 
+class ChannelAttention(layers.Layer):
+    """
+    Squeeze-and-Excitation channel attention.
+    After the Conv1D stem, re-weights each of the 128 channels by learned
+    importance — forces the model to focus on UP-relevant filters.
+    """
+    def __init__(self, channels, reduction=8, **kw):
+        super().__init__(**kw)
+        self.fc1 = layers.Dense(max(channels // reduction, 4), activation="relu")
+        self.fc2 = layers.Dense(channels, activation="sigmoid")
+        self.channels  = channels
+        self.reduction = reduction
+
+    def call(self, x, training=False):
+        gap   = tf.reduce_mean(x, axis=1)
+        scale = tf.expand_dims(self.fc2(self.fc1(gap)), axis=1)
+        return x * scale
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"channels": self.channels, "reduction": self.reduction})
+        return cfg
+
 CUSTOM_OBJECTS = {
     "MultiHeadSelfAttention": MultiHeadSelfAttention,
     "MultiHeadAttention":     MultiHeadAttention,
     "TransformerBlock":       TransformerBlock,
+    "ChannelAttention":       ChannelAttention,
     "gelu":                   gelu,
     "focal_loss_fn":          focal_loss_fn,
     "focal_loss":             focal_loss,
@@ -163,11 +187,11 @@ scaler = None
 if os.path.exists(MODEL_PATH):
     try:
         model = tf.keras.models.load_model(MODEL_PATH, custom_objects=CUSTOM_OBJECTS)
-        print("  ✓ Model loaded:", MODEL_PATH)
+        print("  [OK] Model loaded:", MODEL_PATH)
     except Exception as e:
-        print(f"  ⚠ Model load failed: {e}")
+        print(f"  [WARN] Model load failed: {e}")
 else:
-    print(f"  ⚠ Model not found: {MODEL_PATH} — run clone_file_v2.py to produce it")
+    print(f"  [WARN] Model not found: {MODEL_PATH} - run clone_file_v2.py to produce it")
 
 _scaler_path = None
 for _p in (SCALER_PATH, SCALER_FALLBACK, SCALER_FALLBACK2):
@@ -177,12 +201,12 @@ for _p in (SCALER_PATH, SCALER_FALLBACK, SCALER_FALLBACK2):
 if _scaler_path:
     try:
         scaler = joblib.load(_scaler_path)
-        print("  ✓ Scaler loaded:", _scaler_path)
+        print("  [OK] Scaler loaded:", _scaler_path)
     except Exception as e:
-        print(f"  ⚠ Scaler load failed: {e}")
+        print(f"  [WARN] Scaler load failed: {e}")
 else:
     print(
-        f"  ⚠ No scaler — add {os.path.basename(SCALER_PATH)} next to app.py "
+        f"  [WARN] No scaler - add {os.path.basename(SCALER_PATH)} next to app.py "
         f"(or scaler.pkl)"
     )
 
@@ -199,9 +223,9 @@ try:
     finbert_tok = AutoTokenizer.from_pretrained(src)
     finbert_mdl = AutoModelForSequenceClassification.from_pretrained(src)
     finbert_ok  = True
-    print(f"  ✓ FinBERT loaded from: {src}")
+    print(f"  [OK] FinBERT loaded from: {src}")
 except Exception as e:
-    print(f"  ⚠ FinBERT unavailable: {e}")
+    print(f"  [WARN] FinBERT unavailable: {e}")
 
 def get_news_sentiment(texts):
     if not texts or not finbert_ok:
@@ -333,6 +357,27 @@ def engineer_features(df):
     df["Volatility_5"]  = df["Return"].rolling(5).std()
     df["Volatility_20"] = df["Return"].rolling(20).std()
 
+    # ── NEW bearish features (match clone_file_v2.py) ──────────────────────────
+    # hl, hpc, lpc already computed above — they are used for ATR_ratio.
+    # If running standalone, compute them first:
+    #   hl  = df["High"] - df["Low"]
+    #   hpc = (df["High"] - df[c].shift()).abs()
+    #   lpc = (df["Low"]  - df[c].shift()).abs()
+
+    # 1. Distance from 20-day rolling high (negative = price below recent peak)
+    rolling_high_20 = df[c].rolling(20).max()
+    df["dist_from_high_20"] = df[c] / (rolling_high_20 + 1e-9) - 1
+
+    # 2. Consecutive down-close streak count
+    down_bar = (df[c].diff() < 0).astype(int)
+    groups   = (down_bar != down_bar.shift()).cumsum()
+    df["consec_down"] = down_bar.groupby(groups).cumsum() * down_bar
+
+    # 3. Candle body ratio normalised by ATR-14
+    atr14 = pd.concat([hl, hpc, lpc], axis=1).max(axis=1).rolling(14).mean()
+    df["candle_body_ratio"] = (df["Close"] - df["Open"]) / (atr14 + 1e-9)
+
+    # ── END patch ───────────────────────────────────────────────────────────────
     return df, c
 
 def get_latest_sequence(symbol, sentiment_score=0.0):
@@ -349,18 +394,21 @@ def get_latest_sequence(symbol, sentiment_score=0.0):
     raw["sentiment"] = sentiment_score
     raw = raw.dropna()
 
-    # Columns the model + scaler expect (from config or training defaults)
-    feats = [f for f in FEATURES if f in raw.columns]
-    if len(feats) < len(FEATURES) * 0.85:
-        raise ValueError(f"Feature mismatch: have {len(feats)}/{len(FEATURES)} columns")
+    # Columns expected by scaler/model. We add any missing columns as 0.0 so
+    # small config/training drift does not crash inference.
+    model_feats = list(FEATURES) if FEATURES else []
+    scaler_feats = None
+    if scaler is not None and hasattr(scaler, "feature_names_in_"):
+        scaler_feats = [str(c) for c in scaler.feature_names_in_]
+    feats = scaler_feats or model_feats or [f for f in raw.columns if f != "sentiment"] + ["sentiment"]
 
     df_scaled = raw.copy()
+    for col in feats:
+        if col not in df_scaled.columns:
+            df_scaled[col] = 0.0
+
     if scaler is not None:
-        # Align columns to scaler's expected input
-        all_feats = FEATURES if FEATURES else feats
-        avail     = [f for f in all_feats if f in raw.columns]
-        df_scaled[avail] = scaler.transform(raw[avail])
-        feats = avail
+        df_scaled[feats] = scaler.transform(df_scaled[feats])
 
     seq = df_scaled[feats].values[-LOOKBACK:]
     if len(seq) < LOOKBACK:
@@ -433,10 +481,12 @@ def predict():
         # Keep sentiment_score/model input behavior consistent.
         news_for_ui = get_yf_headlines(symbol, limit=12)
 
-    # Sentiment (model input) computed only from frontend-provided news
+    # Sentiment (model input): prefer frontend-provided news; otherwise use
+    # fetched headlines so sentiment still contributes when news: [] is sent.
     sentiment_score = 0.0
-    if user_news and finbert_ok:
-        sentiment_score = get_news_sentiment(user_news)
+    news_for_model = user_news if user_news else news_for_ui
+    if news_for_model and finbert_ok:
+        sentiment_score = get_news_sentiment(news_for_model)
 
     try:
         seq, feats_used, raw_df = get_latest_sequence(symbol, sentiment_score)
@@ -486,9 +536,9 @@ def predict():
 if __name__ == '__main__':
     print("\n  Starting server at http://localhost:5000")
     print("  Endpoints:")
-    print("    GET  /           → UI")
-    print("    POST /predict, /api/predict → { symbol, news[] } → prediction")
-    print("    GET  /health     → status check")
-    print("    GET  /model_info → config")
+    print("    GET  /           -> UI")
+    print("    POST /predict, /api/predict -> { symbol, news[] } -> prediction")
+    print("    GET  /health     -> status check")
+    print("    GET  /model_info -> config")
     print("=" * 55)
     app.run(debug=False, port=5000, host='0.0.0.0')
