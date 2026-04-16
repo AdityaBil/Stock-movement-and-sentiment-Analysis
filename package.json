@@ -1,0 +1,13 @@
+{
+  "name": "aurelius-stock-predictor",
+  "version": "1.0.0",
+  "description": "AI-driven stock price prediction app",
+  "private": true,
+  "scripts": {
+    "build": "echo 'Python backend - no npm build needed'",
+    "start": "echo 'Use Procfile for startup'"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
