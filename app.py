@@ -1,544 +1,396 @@
-
-import os, json, warnings
+import os
+import json
+import traceback
 import numpy as np
 import pandas as pd
-import joblib
-import yfinance as yf
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-import tensorflow as tf
 
-# Suppress TF noise
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-warnings.filterwarnings('ignore')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# ──────────────────────────────────────────────────────────────
-# Load model config
-# ──────────────────────────────────────────────────────────────
-BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, "model_config.json")
-MODEL_PATH  = os.path.join(BASE_DIR, "stock_model.keras")
-SCALER_PATH = os.path.join(BASE_DIR, "scaler.pkl")
-SCALER_FALLBACK = os.path.join(BASE_DIR, "scaler.pkl")
-SCALER_FALLBACK2 = os.path.join(BASE_DIR, "scaler_sentiment.pkl")
-FINBERT_DIR = os.path.join(BASE_DIR, "finbert_finetuned")
-
-print("=" * 55)
-print("  AURELIUS v4 - Flask Backend Starting")
-print("=" * 55)
-
-# ── Config ──────────────────────────────────────────────────
-cfg = {}
-if os.path.exists(CONFIG_PATH):
-    with open(CONFIG_PATH) as f:
-        cfg = json.load(f)
-    print(f"  [OK] Config loaded: {len(cfg.get('features',[]))} features, "
-          f"lookback={cfg.get('lookback',20)}, threshold={cfg.get('best_threshold',0.5)}")
-else:
-    print("  [WARN] model_config.json not found - run clone_file_v2.py first to train the model")
-
-# Default feature list matches clone_file_v2.py when config is missing
-DEFAULT_FEATURES = [
-    "Open", "High", "Low", "Close", "Volume", "Return",
-    "MA_5", "MA_10", "MA_20", "MA_50",
-    "MA_5_10_cross", "MA_10_20_cross", "MA_20_50_cross",
-    "RSI_7", "RSI_14",
-    "MACD", "MACD_signal", "MACD_hist",
-    "BB_width", "BB_pos",
-    "Volume_Ratio", "High_Low_Ratio", "Close_Open_Ratio",
-    "OBV", "Stoch_K", "Stoch_D", "ATR_ratio",
-    "CCI", "Williams_R",
-    "Momentum_5", "Momentum_10", "Momentum_20",
-    "Volatility_5", "Volatility_20",
-    "sentiment",
-]
-
-LOOKBACK       = cfg.get("lookback", 20)
-BEST_THRESHOLD = cfg.get("best_threshold", 0.5)
-FEATURES       = cfg.get("features", []) or DEFAULT_FEATURES
-FORWARD_DAYS   = cfg.get("forward_days", 3)
-RETURN_THRESHOLD = cfg.get("return_threshold", 0.005)
-SCALER_TYPE    = cfg.get("scaler_type", "RobustScaler")
-
-# ── Keras custom objects needed for model loading ──────────
-def gelu(x):
-    return x * 0.5 * (1.0 + tf.math.erf(x / tf.math.sqrt(2.0)))
-
-def focal_loss(y_true, y_pred):
-    gamma = 2.0; alpha = 0.5
-    y_pred  = tf.clip_by_value(y_pred, 1e-7, 1-1e-7)
-    pt      = tf.where(tf.equal(y_true, 1), y_pred, 1-y_pred)
-    alpha_t = tf.where(tf.equal(y_true, 1), alpha, 1-alpha)
-    return tf.reduce_mean(-alpha_t * tf.pow(1-pt, gamma) * tf.math.log(pt))
-
-# legacy name used by older checkpoints in clone_file_v2.py
-loss_fn = focal_loss
-
-# keep backwards compatibility alias
-focal_loss_fn = focal_loss
-
-from tensorflow.keras import layers
-
-# Layer definitions match clone_file_v2.py (saved models use MultiHeadSelfAttention)
-class MultiHeadSelfAttention(layers.Layer):
-    def __init__(self, d_model, num_heads, **kw):
-        super().__init__(**kw)
-        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
-        self.h  = num_heads
-        self.dk = d_model // num_heads
-        self.d  = d_model
-        self.wq = layers.Dense(d_model)
-        self.wk = layers.Dense(d_model)
-        self.wv = layers.Dense(d_model)
-        self.wo = layers.Dense(d_model)
-
-    def call(self, x, training=False):
-        B = tf.shape(x)[0]
-
-        def split(t):
-            return tf.transpose(tf.reshape(t, (B, -1, self.h, self.dk)), [0, 2, 1, 3])
-
-        q, k, v = split(self.wq(x)), split(self.wk(x)), split(self.wv(x))
-        scale = tf.math.sqrt(tf.cast(self.dk, tf.float32))
-        attn = tf.nn.softmax(tf.matmul(q, k, transpose_b=True) / scale, axis=-1)
-        out = tf.reshape(tf.transpose(tf.matmul(attn, v), [0, 2, 1, 3]), (B, -1, self.d))
-        return self.wo(out)
-
-    def get_config(self):
-        cfg = super().get_config()
-        cfg.update({"d_model": self.d, "num_heads": self.h})
-        return cfg
-
-
-class TransformerBlock(layers.Layer):
-    def __init__(self, d_model, num_heads, d_ff, drop, **kw):
-        super().__init__(**kw)
-        self.attn  = MultiHeadSelfAttention(d_model, num_heads)
-        self.ffn   = tf.keras.Sequential([
-            layers.Dense(d_ff),
-            layers.Activation(gelu),
-            layers.Dropout(drop),
-            layers.Dense(d_model),
-        ])
-        self.norm1 = layers.LayerNormalization(epsilon=1e-6)
-        self.norm2 = layers.LayerNormalization(epsilon=1e-6)
-        self.drop1 = layers.Dropout(drop)
-        self.drop2 = layers.Dropout(drop)
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.d_ff = d_ff
-        self.drop = drop
-
-    def call(self, x, training=False):
-        x = x + self.drop1(self.attn(self.norm1(x), training=training), training=training)
-        x = x + self.drop2(self.ffn(self.norm2(x), training=training), training=training)
-        return x
-
-    def get_config(self):
-        cfg = super().get_config()
-        cfg.update({
-            "d_model": self.d_model, "num_heads": self.num_heads,
-            "d_ff": self.d_ff, "drop": self.drop,
-        })
-        return cfg
-
-# Older checkpoints may serialize as MultiHeadAttention
-MultiHeadAttention = MultiHeadSelfAttention
-
-class ChannelAttention(layers.Layer):
-    """
-    Squeeze-and-Excitation channel attention.
-    After the Conv1D stem, re-weights each of the 128 channels by learned
-    importance — forces the model to focus on UP-relevant filters.
-    """
-    def __init__(self, channels, reduction=8, **kw):
-        super().__init__(**kw)
-        self.fc1 = layers.Dense(max(channels // reduction, 4), activation="relu")
-        self.fc2 = layers.Dense(channels, activation="sigmoid")
-        self.channels  = channels
-        self.reduction = reduction
-
-    def call(self, x, training=False):
-        gap   = tf.reduce_mean(x, axis=1)
-        scale = tf.expand_dims(self.fc2(self.fc1(gap)), axis=1)
-        return x * scale
-
-    def get_config(self):
-        cfg = super().get_config()
-        cfg.update({"channels": self.channels, "reduction": self.reduction})
-        return cfg
-
-CUSTOM_OBJECTS = {
-    "MultiHeadSelfAttention": MultiHeadSelfAttention,
-    "MultiHeadAttention":     MultiHeadAttention,
-    "TransformerBlock":       TransformerBlock,
-    "ChannelAttention":       ChannelAttention,
-    "gelu":                   gelu,
-    "focal_loss_fn":          focal_loss_fn,
-    "focal_loss":             focal_loss,
-    "loss_fn":               loss_fn,
-}
-
-# ── Load model ─────────────────────────────────────────────
-model  = None
-scaler = None
-
-if os.path.exists(MODEL_PATH):
-    try:
-        model = tf.keras.models.load_model(MODEL_PATH, custom_objects=CUSTOM_OBJECTS)
-        print("  [OK] Model loaded:", MODEL_PATH)
-    except Exception as e:
-        print(f"  [WARN] Model load failed: {e}")
-else:
-    print(f"  [WARN] Model not found: {MODEL_PATH} - run clone_file_v2.py to produce it")
-
-_scaler_path = None
-for _p in (SCALER_PATH, SCALER_FALLBACK, SCALER_FALLBACK2):
-    if _p and os.path.exists(_p):
-        _scaler_path = _p
-        break
-if _scaler_path:
-    try:
-        scaler = joblib.load(_scaler_path)
-        print("  [OK] Scaler loaded:", _scaler_path)
-    except Exception as e:
-        print(f"  [WARN] Scaler load failed: {e}")
-else:
-    print(
-        f"  [WARN] No scaler - add {os.path.basename(SCALER_PATH)} next to app.py "
-        f"(or scaler.pkl)"
-    )
-
-# ── FinBERT ────────────────────────────────────────────────
-finbert_ok  = False
-finbert_tok = None
-finbert_mdl = None
-
-try:
-    from transformers import AutoTokenizer, AutoModelForSequenceClassification
-    import torch, torch.nn.functional as torchF
-
-    src = FINBERT_DIR if os.path.exists(FINBERT_DIR) else "ProsusAI/finbert"
-    finbert_tok = AutoTokenizer.from_pretrained(src)
-    finbert_mdl = AutoModelForSequenceClassification.from_pretrained(src)
-    finbert_ok  = True
-    print(f"  [OK] FinBERT loaded from: {src}")
-except Exception as e:
-    print(f"  [WARN] FinBERT unavailable: {e}")
-
-def get_news_sentiment(texts):
-    if not texts or not finbert_ok:
-        return 0.0
-    try:
-        inputs = finbert_tok(list(texts), padding=True, truncation=True,
-                             return_tensors="pt", max_length=512)
-        with torch.no_grad():
-            probs = torchF.softmax(finbert_mdl(**inputs).logits, dim=-1).cpu().numpy()
-        return float(np.mean(probs[:, 0] - probs[:, 1]))  # pos - neg
-    except:
-        return 0.0
-
-def get_yf_headlines(symbol: str, limit: int = 10):
-    """
-    Fetch recent headlines for the symbol.
-    This is UI-supporting data enrichment only (does not alter the model architecture/calls).
-    """
-    try:
-        ticker = yf.Ticker(symbol)
-        items = getattr(ticker, "news", None) or []
-        headlines = []
-        for it in items:
-            title = ""
-
-            # yfinance structure (observed):
-            # { id: ..., content: { title: ..., summary: ..., ... } }
-            if isinstance(it, dict):
-                title = it.get("title") or it.get("headline") or ""  # sometimes present at top-level
-                if not title:
-                    title = it.get("summary") or it.get("description") or ""
-
-                content = it.get("content")
-                if (not title) and isinstance(content, dict):
-                    title = (
-                        content.get("title")
-                        or content.get("headline")
-                        or content.get("summary")
-                        or content.get("description")
-                        or ""
-                    )
-            else:
-                title = str(it)
-
-            title = str(title).strip()
-            if title:
-                headlines.append(title)
-            if len(headlines) >= limit:
-                break
-
-        return headlines
-    except:
-        return []
-
-# ──────────────────────────────────────────────────────────────
-# FEATURE ENGINEERING (mirrors clone_file_v2.py — no Target column)
-# ──────────────────────────────────────────────────────────────
-def rsi(prices, period=14):
-    delta = prices.diff()
-    gain  = delta.clip(lower=0).rolling(period).mean()
-    loss  = (-delta.clip(upper=0)).rolling(period).mean()
-    return 100 - 100 / (1 + gain / (loss + 1e-9))
-
-
-def obv(close, volume):
-    direction = np.sign(close.diff().fillna(0))
-    return (direction * volume).cumsum()
-
-
-def cci(high, low, close, period=20):
-    tp = (high + low + close) / 3
-    ma = tp.rolling(period).mean()
-    md = tp.rolling(period).apply(lambda x: np.mean(np.abs(x - x.mean())), raw=True)
-    return (tp - ma) / (0.015 * md + 1e-9)
-
-
-def engineer_features(df):
-    c = "Adj Close" if "Adj Close" in df.columns else "Close"
-
-    df["Return"]           = df[c].pct_change()
-    df["High_Low_Ratio"]   = df["High"] / df["Low"]
-    df["Close_Open_Ratio"] = df["Close"] / df["Open"]
-
-    for w in [5, 10, 20, 50]:
-        df[f"MA_{w}"] = df[c].rolling(w).mean()
-    df["MA_5_10_cross"]  = df["MA_5"]  - df["MA_10"]
-    df["MA_10_20_cross"] = df["MA_10"] - df["MA_20"]
-    df["MA_20_50_cross"] = df["MA_20"] - df["MA_50"]
-
-    df["RSI_7"]  = rsi(df[c], 7)
-    df["RSI_14"] = rsi(df[c], 14)
-
-    exp1 = df[c].ewm(span=12, adjust=False).mean()
-    exp2 = df[c].ewm(span=26, adjust=False).mean()
-    df["MACD"]        = exp1 - exp2
-    df["MACD_signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
-    df["MACD_hist"]   = df["MACD"] - df["MACD_signal"]
-
-    bb_ma  = df[c].rolling(20).mean()
-    bb_std = df[c].rolling(20).std()
-    df["BB_upper"]  = bb_ma + 2 * bb_std
-    df["BB_lower"]  = bb_ma - 2 * bb_std
-    df["BB_width"]  = (df["BB_upper"] - df["BB_lower"]) / (bb_ma + 1e-9)
-    df["BB_pos"]    = (df[c] - df["BB_lower"]) / (df["BB_upper"] - df["BB_lower"] + 1e-9)
-
-    vol_ma = df["Volume"].rolling(10).mean()
-    df["Volume_Ratio"] = df["Volume"] / (vol_ma + 1e-9)
-    df["OBV"]          = obv(df[c], df["Volume"])
-
-    low14  = df["Low"].rolling(14).min()
-    high14 = df["High"].rolling(14).max()
-    df["Stoch_K"] = 100 * (df["Close"] - low14) / (high14 - low14 + 1e-9)
-    df["Stoch_D"] = df["Stoch_K"].rolling(3).mean()
-
-    hl  = df["High"] - df["Low"]
-    hpc = (df["High"] - df[c].shift()).abs()
-    lpc = (df["Low"]  - df[c].shift()).abs()
-    df["ATR_ratio"] = (
-        pd.concat([hl, hpc, lpc], axis=1).max(axis=1).rolling(14).mean()
-        / (df[c] + 1e-9)
-    )
-
-    df["CCI"]        = cci(df["High"], df["Low"], df["Close"])
-    df["Williams_R"] = -100 * (high14 - df["Close"]) / (high14 - low14 + 1e-9)
-
-    for w in [5, 10, 20]:
-        df[f"Momentum_{w}"] = df[c] / (df[c].shift(w) + 1e-9) - 1
-
-    df["Volatility_5"]  = df["Return"].rolling(5).std()
-    df["Volatility_20"] = df["Return"].rolling(20).std()
-
-    # ── NEW bearish features (match clone_file_v2.py) ──────────────────────────
-    # hl, hpc, lpc already computed above — they are used for ATR_ratio.
-    # If running standalone, compute them first:
-    #   hl  = df["High"] - df["Low"]
-    #   hpc = (df["High"] - df[c].shift()).abs()
-    #   lpc = (df["Low"]  - df[c].shift()).abs()
-
-    # 1. Distance from 20-day rolling high (negative = price below recent peak)
-    rolling_high_20 = df[c].rolling(20).max()
-    df["dist_from_high_20"] = df[c] / (rolling_high_20 + 1e-9) - 1
-
-    # 2. Consecutive down-close streak count
-    down_bar = (df[c].diff() < 0).astype(int)
-    groups   = (down_bar != down_bar.shift()).cumsum()
-    df["consec_down"] = down_bar.groupby(groups).cumsum() * down_bar
-
-    # 3. Candle body ratio normalised by ATR-14
-    atr14 = pd.concat([hl, hpc, lpc], axis=1).max(axis=1).rolling(14).mean()
-    df["candle_body_ratio"] = (df["Close"] - df["Open"]) / (atr14 + 1e-9)
-
-    # ── END patch ───────────────────────────────────────────────────────────────
-    return df, c
-
-def get_latest_sequence(symbol, sentiment_score=0.0):
-    """Download recent data and build latest feature sequence for prediction."""
-    end   = datetime.today()
-    start = end - timedelta(days=max(LOOKBACK * 5, 120))
-    raw   = yf.download(symbol, start=start.strftime('%Y-%m-%d'),
-                        end=end.strftime('%Y-%m-%d'), progress=False)
-    if raw.empty or len(raw) < LOOKBACK + 30:
-        raise ValueError(f"Not enough data for {symbol}")
-    if isinstance(raw.columns, pd.MultiIndex):
-        raw.columns = [col[0] for col in raw.columns]
-    raw, _ = engineer_features(raw)
-    raw["sentiment"] = sentiment_score
-    raw = raw.dropna()
-
-    # Columns expected by scaler/model. We add any missing columns as 0.0 so
-    # small config/training drift does not crash inference.
-    model_feats = list(FEATURES) if FEATURES else []
-    scaler_feats = None
-    if scaler is not None and hasattr(scaler, "feature_names_in_"):
-        scaler_feats = [str(c) for c in scaler.feature_names_in_]
-    feats = scaler_feats or model_feats or [f for f in raw.columns if f != "sentiment"] + ["sentiment"]
-
-    df_scaled = raw.copy()
-    for col in feats:
-        if col not in df_scaled.columns:
-            df_scaled[col] = 0.0
-
-    if scaler is not None:
-        df_scaled[feats] = scaler.transform(df_scaled[feats])
-
-    seq = df_scaled[feats].values[-LOOKBACK:]
-    if len(seq) < LOOKBACK:
-        raise ValueError("Not enough rows after feature engineering")
-    return seq[np.newaxis, ...].astype(np.float32), feats, raw
-
-# ──────────────────────────────────────────────────────────────
-# Flask App
-# ──────────────────────────────────────────────────────────────
-app = Flask(__name__, static_folder='static', template_folder='.')
+app = Flask(__name__, static_folder=BASE_DIR, static_url_path='')
 CORS(app)
 
+# ── Load model artifacts ─────────────────────────────────────────────────────
+model = None
+scaler = None
+model_config = {}
+finbert_tok = None
+finbert_mdl = None
+finbert_ok = False
+
+def load_artifacts():
+    global model, scaler, model_config, finbert_tok, finbert_mdl, finbert_ok
+
+    config_path = os.path.join(BASE_DIR, 'model_config.json')
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            model_config = json.load(f)
+        print(f"  [OK] model_config.json loaded")
+    else:
+        model_config = {
+            'lookback': 25,
+            'forward_days': 3,
+            'best_threshold': 0.5,
+            'features': []
+        }
+        print("  [WARN] model_config.json not found, using defaults")
+
+    scaler_path = os.path.join(BASE_DIR, 'scaler.pkl')
+    if not os.path.exists(scaler_path):
+        scaler_path = os.path.join(BASE_DIR, 'scaler_sentiment.pkl')
+    if os.path.exists(scaler_path):
+        import joblib
+        scaler = joblib.load(scaler_path)
+        print(f"  [OK] scaler loaded from {os.path.basename(scaler_path)}")
+
+    for model_name in ['stock_model.keras', 'best_model.keras']:
+        model_path = os.path.join(BASE_DIR, model_name)
+        if os.path.exists(model_path):
+            try:
+                import tensorflow as tf
+                from tensorflow import keras
+
+                def focal_loss(alpha=0.25, gamma=2.0):
+                    def loss(y_true, y_pred):
+                        y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
+                        bce = -y_true * tf.math.log(y_pred) - (1 - y_true) * tf.math.log(1 - y_pred)
+                        pt = tf.where(y_true == 1, y_pred, 1 - y_pred)
+                        focal = alpha * (1 - pt) ** gamma * bce
+                        return tf.reduce_mean(focal)
+                    return loss
+
+                class MultiHeadSelfAttention(keras.layers.Layer):
+                    def __init__(self, d_model, num_heads, **kwargs):
+                        super().__init__(**kwargs)
+                        self.d_model = d_model
+                        self.num_heads = num_heads
+                        self.depth = d_model // num_heads
+                        self.wq = keras.layers.Dense(d_model)
+                        self.wk = keras.layers.Dense(d_model)
+                        self.wv = keras.layers.Dense(d_model)
+                        self.dense = keras.layers.Dense(d_model)
+
+                    def split_heads(self, x, batch_size):
+                        x = tf.reshape(x, (batch_size, -1, self.num_heads, self.depth))
+                        return tf.transpose(x, perm=[0, 2, 1, 3])
+
+                    def call(self, x):
+                        batch_size = tf.shape(x)[0]
+                        q = self.split_heads(self.wq(x), batch_size)
+                        k = self.split_heads(self.wk(x), batch_size)
+                        v = self.split_heads(self.wv(x), batch_size)
+                        scale = tf.cast(self.depth, tf.float32) ** 0.5
+                        attn = tf.nn.softmax(tf.matmul(q, k, transpose_b=True) / scale)
+                        out = tf.transpose(tf.matmul(attn, v), perm=[0, 2, 1, 3])
+                        out = tf.reshape(out, (batch_size, -1, self.d_model))
+                        return self.dense(out)
+
+                    def get_config(self):
+                        cfg = super().get_config()
+                        cfg.update({'d_model': self.d_model, 'num_heads': self.num_heads})
+                        return cfg
+
+                class TransformerBlock(keras.layers.Layer):
+                    def __init__(self, d_model, num_heads, d_ff, dropout=0.1, **kwargs):
+                        super().__init__(**kwargs)
+                        self.attn = MultiHeadSelfAttention(d_model, num_heads)
+                        self.ffn = keras.Sequential([
+                            keras.layers.Dense(d_ff, activation='gelu'),
+                            keras.layers.Dense(d_model)
+                        ])
+                        self.norm1 = keras.layers.LayerNormalization(epsilon=1e-6)
+                        self.norm2 = keras.layers.LayerNormalization(epsilon=1e-6)
+                        self.drop1 = keras.layers.Dropout(dropout)
+                        self.drop2 = keras.layers.Dropout(dropout)
+                        self.d_model = d_model
+                        self.num_heads = num_heads
+                        self.d_ff = d_ff
+                        self.dropout_rate = dropout
+
+                    def call(self, x, training=False):
+                        x = self.norm1(x + self.drop1(self.attn(x), training=training))
+                        return self.norm2(x + self.drop2(self.ffn(x), training=training))
+
+                    def get_config(self):
+                        cfg = super().get_config()
+                        cfg.update({'d_model': self.d_model, 'num_heads': self.num_heads,
+                                    'd_ff': self.d_ff, 'dropout': self.dropout_rate})
+                        return cfg
+
+                class ChannelAttention(keras.layers.Layer):
+                    def __init__(self, filters, reduction=8, **kwargs):
+                        super().__init__(**kwargs)
+                        self.avg_pool = keras.layers.GlobalAveragePooling1D()
+                        self.fc1 = keras.layers.Dense(max(1, filters // reduction), activation='relu')
+                        self.fc2 = keras.layers.Dense(filters, activation='sigmoid')
+                        self.filters = filters
+                        self.reduction = reduction
+
+                    def call(self, x):
+                        attn = self.fc2(self.fc1(self.avg_pool(x)))
+                        return x * tf.expand_dims(attn, 1)
+
+                    def get_config(self):
+                        cfg = super().get_config()
+                        cfg.update({'filters': self.filters, 'reduction': self.reduction})
+                        return cfg
+
+                custom_objects = {
+                    'MultiHeadSelfAttention': MultiHeadSelfAttention,
+                    'TransformerBlock': TransformerBlock,
+                    'ChannelAttention': ChannelAttention,
+                    'loss': focal_loss()
+                }
+                model = keras.models.load_model(model_path, custom_objects=custom_objects)
+                print(f"  [OK] Model loaded: {model_name}")
+                break
+            except Exception as e:
+                print(f"  [WARN] Could not load {model_name}: {e}")
+
+    finbert_dir = os.path.join(BASE_DIR, 'finbert')
+    try:
+        from transformers import AutoTokenizer, AutoModelForSequenceClassification
+        src = finbert_dir if os.path.exists(finbert_dir) else "ProsusAI/finbert"
+        finbert_tok = AutoTokenizer.from_pretrained(src)
+        finbert_mdl = AutoModelForSequenceClassification.from_pretrained(src)
+        finbert_ok = True
+        print(f"  [OK] FinBERT loaded from: {src}")
+    except Exception as e:
+        print(f"  [WARN] FinBERT not available: {e}")
+
+
+load_artifacts()
+
+
+# ── Feature engineering ───────────────────────────────────────────────────────
+def compute_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / (loss + 1e-10)
+    return 100 - (100 / (1 + rs))
+
+
+def compute_features(df, sentiment_score=0.0):
+    df = df.copy()
+    df['Return'] = df['Close'].pct_change()
+    for w in [5, 10, 20, 50]:
+        df[f'MA_{w}'] = df['Close'].rolling(w).mean()
+    df['MA_5_cross_20'] = (df['MA_5'] > df['MA_20']).astype(float)
+    df['MA_10_cross_50'] = (df['MA_10'] > df['MA_50']).astype(float)
+    df['MA_20_cross_50'] = (df['MA_20'] > df['MA_50']).astype(float)
+    df['RSI_14'] = compute_rsi(df['Close'], 14)
+    df['RSI_7'] = compute_rsi(df['Close'], 7)
+    ema12 = df['Close'].ewm(span=12).mean()
+    ema26 = df['Close'].ewm(span=26).mean()
+    df['MACD'] = ema12 - ema26
+    df['MACD_signal'] = df['MACD'].ewm(span=9).mean()
+    df['MACD_hist'] = df['MACD'] - df['MACD_signal']
+    bb_mid = df['Close'].rolling(20).mean()
+    bb_std = df['Close'].rolling(20).std()
+    df['BB_upper'] = bb_mid + 2 * bb_std
+    df['BB_lower'] = bb_mid - 2 * bb_std
+    df['BB_width'] = (df['BB_upper'] - df['BB_lower']) / (bb_mid + 1e-10)
+    df['BB_pos'] = (df['Close'] - df['BB_lower']) / (df['BB_upper'] - df['BB_lower'] + 1e-10)
+    df['Volatility_5'] = df['Return'].rolling(5).std()
+    df['Volatility_20'] = df['Return'].rolling(20).std()
+    df['OBV'] = (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
+    df['Volume_Ratio'] = df['Volume'] / (df['Volume'].rolling(20).mean() + 1e-10)
+    low14 = df['Low'].rolling(14).min()
+    high14 = df['High'].rolling(14).max()
+    df['Stoch_K'] = (df['Close'] - low14) / (high14 - low14 + 1e-10) * 100
+    df['Stoch_D'] = df['Stoch_K'].rolling(3).mean()
+    tr = pd.concat([
+        df['High'] - df['Low'],
+        (df['High'] - df['Close'].shift()).abs(),
+        (df['Low'] - df['Close'].shift()).abs()
+    ], axis=1).max(axis=1)
+    atr = tr.rolling(14).mean()
+    df['ATR_ratio'] = atr / (df['Close'] + 1e-10)
+    df['CCI'] = (df['Close'] - df['Close'].rolling(20).mean()) / (0.015 * df['Close'].rolling(20).std() + 1e-10)
+    df['Williams_R'] = -100 * (high14 - df['Close']) / (high14 - low14 + 1e-10)
+    for w in [5, 10, 20]:
+        df[f'Momentum_{w}'] = df['Close'].pct_change(w)
+    df['ma_alignment'] = ((df['MA_5'] > df['MA_10']) & (df['MA_10'] > df['MA_20'])).astype(float)
+    df['ema_slope_5'] = df['Close'].ewm(span=5).mean().diff()
+    df['ema_slope_20'] = df['Close'].ewm(span=20).mean().diff()
+    df['rsi_momentum'] = df['RSI_14'].diff()
+    df['price_range_pos'] = (df['Close'] - df['Low']) / (df['High'] - df['Low'] + 1e-10)
+    df['up_days_5'] = (df['Return'] > 0).rolling(5).sum()
+    df['vpt_norm'] = (df['Volume'] * df['Return']).fillna(0).cumsum() / (df['Volume'].cumsum() + 1e-10)
+    df['gap_signal'] = (df['Open'] - df['Close'].shift()) / (df['Close'].shift() + 1e-10)
+    df['above_ma50'] = (df['Close'] > df['MA_50']).astype(float)
+    df['dist_from_high_20'] = (df['High'].rolling(20).max() - df['Close']) / (df['Close'] + 1e-10)
+    df['consec_down'] = df['Return'].apply(lambda x: 1 if x < 0 else 0).rolling(3).sum()
+    df['candle_body_ratio'] = (df['Close'] - df['Open']).abs() / (df['High'] - df['Low'] + 1e-10)
+    df['sentiment'] = sentiment_score
+    return df
+
+
+def get_sentiment(headlines):
+    if not finbert_ok or not headlines:
+        return 0.0
+    try:
+        import torch
+        scores = []
+        for h in headlines[:10]:
+            inputs = finbert_tok(h, return_tensors='pt', truncation=True, max_length=128)
+            with torch.no_grad():
+                logits = finbert_mdl(**inputs).logits
+            probs = torch.softmax(logits, dim=1)[0].tolist()
+            scores.append(probs[0] - probs[1])
+        return float(np.mean(scores))
+    except Exception:
+        return 0.0
+
+
+def get_headlines(symbol):
+    try:
+        import yfinance as yf
+        ticker = yf.Ticker(symbol)
+        news = ticker.news or []
+        return [n.get('title', '') or n.get('content', {}).get('title', '') for n in news[:15] if n]
+    except Exception:
+        return []
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
 @app.route('/')
 def index():
-    html_path = os.path.join(BASE_DIR, 'index.html')
-    if os.path.exists(html_path):
-        return send_file(html_path)
-    return jsonify({"status": "running", "message": "index.html not found in project dir"})
+    return send_from_directory(BASE_DIR, 'index.html')
+
 
 @app.route('/health')
 def health():
     return jsonify({
-        "status":     "ok",
-        "model":      model is not None,
-        "scaler":     scaler is not None,
-        "finbert":    finbert_ok,
-        "config":     bool(cfg),
-        "timestamp":  datetime.now().isoformat()
+        'status': 'ok',
+        'model': model is not None,
+        'scaler': scaler is not None,
+        'finbert': finbert_ok,
+        'timestamp': datetime.utcnow().isoformat()
     })
+
 
 @app.route('/model_info')
 def model_info():
     return jsonify({
-        **cfg,
-        "model_loaded":   model  is not None,
-        "scaler_loaded":  scaler is not None,
-        "finbert_loaded": finbert_ok,
+        'config': model_config,
+        'model_loaded': model is not None,
+        'scaler_loaded': scaler is not None
     })
-
-
-def _recent_ohlcv(raw_df, n=60):
-    """Last n rows for chart/table (matches frontend recent_data)."""
-    cl = "Adj Close" if "Adj Close" in raw_df.columns else "Close"
-    take = raw_df.tail(n).copy()
-    idx = take.index
-    if isinstance(idx, pd.DatetimeIndex):
-        dates = idx.strftime("%Y-%m-%d").tolist()
-    else:
-        dates = [str(x)[:10] for x in idx]
-    out = []
-    for i, dt in enumerate(dates):
-        row = take.iloc[i]
-        vol = float(row["Volume"]) if "Volume" in take.columns else None
-        out.append({"Date": dt, "Close": float(row[cl]), "Volume": vol})
-    return out
 
 
 @app.route('/predict', methods=['POST'])
 @app.route('/api/predict', methods=['POST'])
 def predict():
-    if model is None or scaler is None:
-        return jsonify({"error": "Model not loaded. Run clone_file_v2.py first to train."}), 503
-
-    data   = request.get_json(force=True)
-    symbol = data.get("symbol", "AAPL").upper().strip()
-    user_news   = data.get("news", [])   # list of headline strings provided by frontend
-    news_for_ui  = user_news
-    if not user_news:
-        # Frontend currently sends `news: []`. Enrich for UI headlines only.
-        # Keep sentiment_score/model input behavior consistent.
-        news_for_ui = get_yf_headlines(symbol, limit=12)
-
-    # Sentiment (model input): prefer frontend-provided news; otherwise use
-    # fetched headlines so sentiment still contributes when news: [] is sent.
-    sentiment_score = 0.0
-    news_for_model = user_news if user_news else news_for_ui
-    if news_for_model and finbert_ok:
-        sentiment_score = get_news_sentiment(news_for_model)
-
     try:
-        seq, feats_used, raw_df = get_latest_sequence(symbol, sentiment_score)
+        body = request.get_json(force=True) or {}
+        symbol = str(body.get('symbol', '')).strip().upper()
+        if not symbol:
+            return jsonify({'error': 'symbol is required'}), 400
+        if len(symbol) > 10:
+            return jsonify({'error': 'invalid symbol'}), 400
+
+        import yfinance as yf
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period='6mo')
+        if df is None or len(df) < 30:
+            return jsonify({'error': f'Not enough data for {symbol}. Check the ticker symbol.'}), 400
+
+        df = df.reset_index()
+        df.columns = [c if c != 'Datetime' else 'Date' for c in df.columns]
+        if 'Date' not in df.columns and df.columns[0] != 'Date':
+            df = df.rename(columns={df.columns[0]: 'Date'})
+
+        df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize(None)
+        df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+
+        headlines = get_headlines(symbol)
+        sentiment_score = get_sentiment(headlines)
+
+        df_feat = compute_features(df, sentiment_score)
+        df_feat = df_feat.replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0)
+
+        feature_cols = model_config.get('features', [])
+        if not feature_cols:
+            feature_cols = [c for c in df_feat.columns if c not in ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+
+        missing = [c for c in feature_cols if c not in df_feat.columns]
+        for m in missing:
+            df_feat[m] = 0.0
+
+        lookback = model_config.get('lookback', 25)
+        threshold = model_config.get('best_threshold', 0.5)
+
+        if model is not None and scaler is not None:
+            feat_data = df_feat[feature_cols].values
+            if len(feat_data) < lookback:
+                return jsonify({'error': f'Need at least {lookback} days of data'}), 400
+
+            n_feat = feat_data.shape[1]
+            n_scaler = scaler.n_features_in_ if hasattr(scaler, 'n_features_in_') else n_feat
+            if n_feat < n_scaler:
+                feat_data = np.pad(feat_data, ((0, 0), (0, n_scaler - n_feat)))
+            elif n_feat > n_scaler:
+                feat_data = feat_data[:, :n_scaler]
+
+            feat_scaled = scaler.transform(feat_data)
+            seq = feat_scaled[-lookback:]
+            seq = seq.reshape(1, lookback, -1)
+            prob_up = float(model.predict(seq, verbose=0)[0][0])
+        else:
+            rsi = float(df_feat['RSI_14'].iloc[-1]) if 'RSI_14' in df_feat.columns else 50.0
+            macd = float(df_feat['MACD'].iloc[-1]) if 'MACD' in df_feat.columns else 0.0
+            prob_up = 0.5 + (rsi - 50) / 200 + macd / 100 + sentiment_score * 0.1
+            prob_up = float(np.clip(prob_up, 0.3, 0.75))
+
+        signal = 'UP' if prob_up >= threshold else 'DOWN'
+        confidence = prob_up * 100 if signal == 'UP' else (1 - prob_up) * 100
+
+        last = df_feat.iloc[-1]
+        rsi_val = float(last.get('RSI_14', np.nan)) if 'RSI_14' in last.index else None
+        macd_val = float(last.get('MACD', np.nan)) if 'MACD' in last.index else None
+        bb_width = float(last.get('BB_width', np.nan)) if 'BB_width' in last.index else None
+        vol_ratio = float(last.get('Volume_Ratio', np.nan)) if 'Volume_Ratio' in last.index else None
+
+        recent_rows = []
+        for _, row in df.tail(60).iterrows():
+            recent_rows.append({
+                'Date': row['Date'].strftime('%Y-%m-%d'),
+                'Open': round(float(row['Open']), 4),
+                'High': round(float(row['High']), 4),
+                'Low': round(float(row['Low']), 4),
+                'Close': round(float(row['Close']), 4),
+                'Volume': int(row['Volume'])
+            })
+
+        return jsonify({
+            'symbol': symbol,
+            'signal': signal,
+            'probability_up': round(prob_up, 4),
+            'probability_down': round(1 - prob_up, 4),
+            'probability': round(confidence, 2),
+            'confidence': round(confidence, 2),
+            'latest_price': round(float(df['Close'].iloc[-1]), 2),
+            'current_price': round(float(df['Close'].iloc[-1]), 2),
+            'rsi': round(rsi_val, 2) if rsi_val is not None and not np.isnan(rsi_val) else None,
+            'macd': round(macd_val, 4) if macd_val is not None and not np.isnan(macd_val) else None,
+            'bb_width': round(bb_width, 4) if bb_width is not None and not np.isnan(bb_width) else None,
+            'volume_ratio': round(vol_ratio, 4) if vol_ratio is not None and not np.isnan(vol_ratio) else None,
+            'sentiment_score': round(sentiment_score, 4),
+            'headlines': headlines[:15],
+            'recent_data': recent_rows,
+            'timestamp': datetime.utcnow().isoformat(),
+            'model_used': 'neural_network' if model is not None else 'heuristic'
+        })
+
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
-    prob   = float(model.predict(seq, verbose=0).flatten()[0])
-    signal = "UP" if prob > BEST_THRESHOLD else "DOWN"
-    conf_pct = round((prob if signal == "UP" else (1.0 - prob)) * 100, 2)
 
-    cl_col = "Adj Close" if "Adj Close" in raw_df.columns else "Close"
-    price  = float(raw_df[cl_col].iloc[-1])
-    rsi_val = float(raw_df["RSI_14"].iloc[-1]) if "RSI_14" in raw_df.columns else None
-    macd_v  = float(raw_df["MACD"].iloc[-1]) if "MACD" in raw_df.columns else None
-    vol_ratio = float(raw_df["Volume_Ratio"].iloc[-1]) if "Volume_Ratio" in raw_df.columns else None
-    bb_w = float(raw_df["BB_width"].iloc[-1]) if "BB_width" in raw_df.columns else None
-    headlines = [str(h).strip() for h in (news_for_ui or []) if str(h).strip()]
-    recent = _recent_ohlcv(raw_df, n=60)
-
-    payload = {
-        "symbol":           symbol,
-        "signal":           signal,
-        "prediction":       signal,
-        "probability_up":   round(prob, 4),
-        "probability_down": round(1 - prob, 4),
-        "probability":       conf_pct,
-        "threshold":        BEST_THRESHOLD,
-        "sentiment_score":  round(sentiment_score, 4),
-        "avg_sentiment":    round(sentiment_score, 4),
-        "latest_price":     round(price, 2),
-        "current_price":    round(price, 2),
-        "rsi":              round(rsi_val, 2) if rsi_val is not None else None,
-        "macd":             round(macd_v, 4) if macd_v is not None else None,
-        "volume_ratio":     round(vol_ratio, 4) if vol_ratio is not None else None,
-        "bb_width":         round(bb_w, 6) if bb_w is not None else None,
-        "headlines":        headlines,
-        "recent_data":      recent,
-        "features_used":    len(feats_used),
-        "lookback_days":    LOOKBACK,
-        "forward_days":     FORWARD_DAYS,
-        "return_threshold_pct": round(float(RETURN_THRESHOLD) * 100, 2),
-        "timestamp":        datetime.now().isoformat(),
-    }
-    return jsonify(payload)
-
-# ──────────────────────────────────────────────────────────────
 if __name__ == '__main__':
-    print("\n  Starting server at http://localhost:5000")
-    print("  Endpoints:")
-    print("    GET  /           -> UI")
-    print("    POST /predict, /api/predict -> { symbol, news[] } -> prediction")
-    print("    GET  /health     -> status check")
-    print("    GET  /model_info -> config")
-    print("=" * 55)
-    app.run(debug=False, port=5000, host='0.0.0.0')
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
